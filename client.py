@@ -70,7 +70,6 @@ def decrypt_message(ciphertext):
             except ValueError:
                 continue
         else:
-            # neither worked
             raise ValueError("could not decrypt block")
 
     return data
@@ -122,7 +121,7 @@ def recv_encrypted(sock):
 def receive_messages(data_socket):
     global command_response, pending_login
 
-    # continue listening for mssges until the connection closes/error happens
+    # continue listening until the connection closes/error happens
     while True:
         try:
             ciphertext = recv_encrypted(data_socket)

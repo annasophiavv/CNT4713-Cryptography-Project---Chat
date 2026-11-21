@@ -16,6 +16,10 @@ clients = {}
 # protects clients dictionary
 clients_lock = threading.Lock()
 
+# Serialize complete frames sent to each client data socket.
+socket_send_locks = {}
+socket_send_locks_guard = threading.Lock()
+
 # encrypt a message using the recipient's public key
 def encrypt_message(message, public_key):
 
@@ -100,7 +104,10 @@ def send_encrypted(connection, message, public_key):
 
     message_length = struct.pack("!I", len(encrypted_data))
 
-    connection.sendall(message_length + encrypted_data)
+    with socket_send_locks_guard:
+        send_lock = socket_send_locks.setdefault(connection, threading.Lock())
+    with send_lock:
+        connection.sendall(message_length + encrypted_data)
 
 # compute SHA256 hash and send it encrypted
 def send_message_hash(connection, message, recipient_public_key):
@@ -127,7 +134,7 @@ def receive_encrypted(connection, private_key):
 
     message_length = struct.unpack("!I", length_bytes)[0]
 
-    if message_length == 0 or message_length > 8 * 1024 * 1024:
+    if message_length == 0 or message_length > 8 * 1024 * 1024 or message_length % 256:
         raise ValueError("Invalid message length")
 
     encrypted_data = receive_exact(connection, message_length)
@@ -241,6 +248,8 @@ def handle_client(control_connection, data_connection, private_key):
                         raise ValueError("Invalid RSA public key")
 
                 except (ValueError, TypeError):
+                    # A malformed login may not contain a usable client key.
+                    # Without a key, an encrypted failure response is impossible.
                     break
 
                 print(
@@ -654,6 +663,9 @@ def handle_client(control_connection, data_connection, private_key):
         except OSError:
             pass
 
+        with socket_send_locks_guard:
+            socket_send_locks.pop(data_connection, None)
+
 
 # START SERVER
 def main():
@@ -733,110 +745,44 @@ def main():
 
 
     while True:
-
-        # wait for a new client
-        control_connection, client_address = (
-            server_socket.accept()
-        )
-
-
-        print(
-            "Connection requested. "
-            "Creating data socket"
-        )
+        control_connection, client_address = server_socket.accept()
+        threading.Thread(
+            target=setup_connection,
+            args=(control_connection, private_key, public_key_pem),
+            daemon=True,
+        ).start()
 
 
-        # receive CONNECT command
-        command = control_connection.recv(
-            1024
-        ).decode().strip()
-
-
-        connect_parts = command.split()
-
-
-        # connect command should contain:
-        # connect <ip> <port>
-        if (
-            len(connect_parts) != 3
-            or connect_parts[0] != "connect"
-        ):
-
-            control_connection.sendall(
-                "500\n\n".encode()
-            )
-
-            control_connection.close()
-
-            continue
-
-
-        # create a separate TCP socket
-        # for the data connection
-        data_socket = socket.socket(
-            socket.AF_INET,
-            socket.SOCK_STREAM
-        )
-
-
-        data_socket.setsockopt(
-            socket.SOL_SOCKET,
-            socket.SO_REUSEADDR,
-            1
-        )
-
-
-        # OS chooses an available data port
-        data_socket.bind(
-            ("", 0)
-        )
-
-
-        data_port = (
-            data_socket.getsockname()[1]
-        )
-
-
-        data_socket.listen()
-
-
-        # send data port and server public key to client
-        response = (
-            "200\n\n"
-            + str(data_port)
-            + "\n"
-            + public_key_pem
-        )
-
-
-        control_connection.sendall(
-            response.encode()
-        )
-
-
-        # wait for client to create data connection
-        data_connection, data_address = (
-            data_socket.accept()
-        )
-
-
-        # temporary listening socket is no longer needed
-        data_socket.close()
-
-
-        # create separate thread for client
-        client_thread = threading.Thread(
-            target=handle_client,
-            args=(
-                control_connection,
-                data_connection,
-                private_key
-            ),
-            daemon=True
-        )
-
-
-        client_thread.start()
+def setup_connection(control_connection, private_key, public_key_pem):
+    """Perform the plaintext handshake without blocking new clients."""
+    data_listener = None
+    try:
+        control_connection.settimeout(10)
+        command = control_connection.recv(1024).decode('utf-8').strip()
+        fields = command.split()
+        if len(fields) != 3 or fields[0] != 'connect':
+            control_connection.sendall(b'500\n\n')
+            return
+        # The client-supplied IP/port are handshake fields, not a trusted destination.
+        print('Connection requested. Creating data socket')
+        data_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        data_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        data_listener.bind(('', 0))
+        data_listener.listen(1)
+        data_listener.settimeout(10)
+        data_port = data_listener.getsockname()[1]
+        response = '200\n\n' + str(data_port) + '\n' + public_key_pem
+        control_connection.sendall(response.encode('utf-8'))
+        data_connection, _ = data_listener.accept()
+        control_connection.settimeout(None)
+        data_connection.settimeout(None)
+        handle_client(control_connection, data_connection, private_key)
+    except (OSError, UnicodeError, ValueError):
+        pass
+    finally:
+        if data_listener is not None:
+            data_listener.close()
+        control_connection.close()
 
 
 

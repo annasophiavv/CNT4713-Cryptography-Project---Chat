@@ -18,415 +18,334 @@ OAEP = padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256()
 CHUNK_SIZE = BLOCK_SIZE - 2 * hashes.SHA256().digest_size - 2
 MAX_FRAME = 8 * 1024 * 1024  
 
-
-def make_oaep(hash_type):
-    return padding.OAEP(
-        mgf=padding.MGF1(algorithm=hash_type()),
-        algorithm=hash_type(),
-        label=None
-    )
+def encrypt_bytes(data, public_key):
+    if not data:
+        raise ValueError('Cannot encrypt an empty payload')
+    return b''.join(public_key.encrypt(data[i:i + CHUNK_SIZE], OAEP)
+                    for i in range(0, len(data), CHUNK_SIZE))
 
 
-# padding used when we encrypt
-OAEP = make_oaep(SEND_HASH)
-
-CHUNK_SIZE = BLOCK_SIZE - 2 * SEND_HASH.digest_size - 2
-
-DECRYPT_PADDINGS = [make_oaep(hashes.SHA256), make_oaep(hashes.SHA1)]
-
-private_key = None
-public_pem = None
-server_public_key = None
-
-# stores responses from server
-command_response = None
-
-# tells main thread when a response is ready
-response_event = threading.Event()
-
-# username to log in with
-pending_login = None
+def decrypt_bytes(data, private_key):
+    if not data or len(data) % BLOCK_SIZE:
+        raise ValueError('Invalid RSA ciphertext length')
+    return b''.join(private_key.decrypt(data[i:i + BLOCK_SIZE], OAEP)
+                    for i in range(0, len(data), BLOCK_SIZE))
 
 
-# encrypt text with a public key, one chunk at a time
-def encrypt_message(text, key):
-    data = text.encode()
-    ciphertext = b""
-
-    for i in range(0, len(data), CHUNK_SIZE):
-        ciphertext += key.encrypt(data[i:i + CHUNK_SIZE], OAEP)
-
-    return ciphertext
-
-
-# decrypt with our private key
-def decrypt_message(ciphertext):
-    data = b""
-
-    for i in range(0, len(ciphertext), BLOCK_SIZE):
-        block = ciphertext[i:i + BLOCK_SIZE]
-
-        for pad in DECRYPT_PADDINGS:
-            try:
-                data += private_key.decrypt(block, pad)
-                break
-            except ValueError:
-                continue
-        else:
-            raise ValueError("could not decrypt block")
-
-    return data
-
-
-# ------------------------------------------------------------
-
-def send_encrypted(sock, text):
-    global command_response
-
-    ciphertext = encrypt_message(text, server_public_key)
-
-    try:
-        sock.sendall(struct.pack("!I", len(ciphertext)) + ciphertext)
-
-    except (ConnectionError, OSError):
-        command_response = "500\n\n"
-        response_event.set()
-
-
-# keep calling recv until we have exactly n bytes
-def recv_exact(sock, n):
-    data = b""
-
-    while len(data) < n:
-        chunk = sock.recv(n - len(data))
-
-        # connection closed
+def recv_exact(sock, size):
+    result = bytearray()
+    while len(result) < size:
+        chunk = sock.recv(size - len(result))
         if not chunk:
-            return None
+            raise ConnectionError('Connection closed')
+        result.extend(chunk)
+    return bytes(result)
 
-        data += chunk
-
-    return data
-
-
-# read one full encrypted message from the socket
-def recv_encrypted(sock):
-    header = recv_exact(sock, 4)
-
-    if header is None:
-        return None
-
-    length = struct.unpack("!I", header)[0]
-    return recv_exact(sock, length)
+def send_encrypted(sock, data, public_key):
+    if isinstance(data, str):
+        data = data.encode('utf-8')
+    ciphertext = encrypt_bytes(data, public_key)
+    if len(ciphertext) > MAX_FRAME:
+        raise ValueError('Message exceeds maximum frame size')
+    sock.sendall(struct.pack('!I', len(ciphertext)) + ciphertext)
 
 
-# listen for messages coming from server through the data socket
-def receive_messages(data_socket):
-    global command_response, pending_login
-
-    # continue listening until the connection closes/error happens
-    while True:
-        try:
-            ciphertext = recv_encrypted(data_socket)
-
-            if ciphertext is None:
-                break
-
-            try:
-                message = decrypt_message(ciphertext).decode()
-            except (ValueError, UnicodeDecodeError):
-                continue
-
-            # Broadcast message
-            if message.startswith("200\n\nBroadcast\n"):
-                parts = message.split("\n", 4)
-
-                if len(parts) >= 5:
-                    print("Received encrypted message")
-                    print(parts[0] + " status code received.")
-                    print("Broadcast message from", parts[3] + ":", parts[4])
-
-            # Private message
-            elif message.startswith("200\n\nPrivate\n"):
-                parts = message.split("\n", 4)
-
-                if len(parts) >= 5:
-                    print("Received encrypted message")
-                    print(parts[0] + " status code received.")
-                    print(parts[3] + ":", parts[4])
-
-            # Join notification
-            elif message.startswith("200\n\njoin\n"):
-                joined_user = message.split("\n", 3)[3].strip()
-
-                if pending_login is not None and joined_user == pending_login:
-                    pending_login = None
-                    print("Received encrypted message")
-                    command_response = message
-                    response_event.set()
-
-            # Logout notification
-            elif message.startswith("200\n\nLogout\n"):
-                pass
-
-            # Response to a command 
-            elif is_status_message(message):
-                pending_login = None
-                print("Received encrypted message")
-                command_response = message
-                response_event.set()
-
-            else:
-                pass
-
-        except (ConnectionError, OSError):
-            break
-
-    # connection is gone
-    if not response_event.is_set():
-        command_response = "500\n\n"
-        response_event.set()
+def receive_encrypted(sock, private_key):
+    length = struct.unpack('!I', recv_exact(sock, 4))[0]
+    if length == 0 or length > MAX_FRAME or length % BLOCK_SIZE:
+        raise ValueError('Invalid encrypted frame length')
+    return decrypt_bytes(recv_exact(sock, length), private_key)
 
 
-# wait until receiver thread gets a normal command response
-def wait_for_response():
-    global command_response
-
-    # pause thread until response_event.set() is called
-    if not response_event.wait(timeout=10):
-        return "500\n\n"
-
-    response = command_response
-
-    command_response = None
-    response_event.clear()
-
-    return response
-
-
-def is_status_message(message):
-    return (
-        len(message) >= 3
-        and message[:3].isdigit()
-        and (len(message) == 3 or message[3] == "\n")
-    )
-
-
-# getting the status code from server response
-def get_status(response):
-    return response.split("\n", 1)[0].strip()
-
-
-# read the plaintext connect response until the whole public key has arrived
-def recv_connect_response(sock):
-    data = b""
-
-    while b"-----END PUBLIC KEY-----" not in data:
+def receive_connect_response(sock):
+    # The current team server sends a plaintext status, data port, and PEM key.
+    result = bytearray()
+    marker = b'-----END PUBLIC KEY-----'
+    while marker not in result:
         chunk = sock.recv(4096)
-
-        # server closed early or sent an error with no key
         if not chunk:
+            raise ConnectionError('Server closed during handshake')
+        result.extend(chunk)
+        if result.startswith(b'500'):
             break
+        if len(result) > 16384:
+            raise ValueError('Handshake too large')
+    return result.decode('utf-8')
 
-        data += chunk
+class ChatClient:
+    def __init__(self):
+        self.private_key = rsa.generate_private_key(public_exponent=65537, key_size=KEY_SIZE)
+        self.public_pem = self.private_key.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode('utf-8')
+        self.server_key = None
+        self.control = None
+        self.data = None
+        self.username = None
+        self.responses = deque()
+        self.response_condition = threading.Condition()
+        self.send_lock = threading.Lock()
+        self.running = False
+        self.pending_file = None
+        self.pending_file_lock = threading.Lock()
 
-        if data.startswith(b"500"):
-            break
+    def connected(self):
+        return self.control is not None and self.data is not None
 
-    return data.decode()
+    def close(self):
+        self.running = False
+        for sock in (self.control, self.data):
+            if sock:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                sock.close()
+        self.control = self.data = None
+        with self.response_condition:
+            self.response_condition.notify_all()
 
-
-# deals w user input/sends commands to server
-def main():
-    global private_key, public_pem, server_public_key, pending_login
-
-    print("Starting client...")
-
-    private_key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=KEY_SIZE
-    )
-
-    # public key as PEM text so it can be sent in the login message
-    public_pem = private_key.public_key().public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
-    ).decode()
-
-    control_socket = None
-    data_socket = None
-
-    # continue asking user for command until it quits
-    while True:
+def connect(self, host, port):
+        if self.connected() or self.control is not None:
+            print('500 status code received.')
+            return
+        control = None
+        data = None
         try:
-            command = input()
-        except EOFError:
-            break
+            control = socket.create_connection((host, int(port)), timeout=10)
+            control.settimeout(None)
+            control.sendall(f'connect {host} {port}'.encode('utf-8'))
+            response = receive_connect_response(control)
+            status, separator, payload = response.partition('\n\n')
+            if status.strip() != '200' or not separator:
+                raise ValueError('Server rejected connection')
+            data_port_text, separator, pem = payload.partition('\n')
+            if not separator:
+                raise ValueError('Server did not supply its public key')
+            data_port = int(data_port_text.strip())
+            server_key = serialization.load_pem_public_key(pem.strip().encode('utf-8'))
+            if not isinstance(server_key, rsa.RSAPublicKey) or server_key.key_size != KEY_SIZE:
+                raise ValueError('Unsupported server public key')
+            data = socket.create_connection((host, data_port), timeout=10)
+            data.settimeout(None)
+            self.control, self.data, self.server_key = control, data, server_key
+            self.running = True
+            threading.Thread(target=self.receive_loop, daemon=True).start()
+            print('200 status code received. Starting data connection on port', data_port)
+        except (OSError, ValueError, TypeError):
+            print('500 status code received.')
+            if control:
+                control.close()
+            if data:
+                data.close()
+            self.control = self.data = None
 
-        parts = command.split()
+def send_command(self, text):
+        if not self.connected():
+            print('500 status code received.')
+            return False
+        try:
+            with self.send_lock:
+                send_encrypted(self.control, text, self.server_key)
+            return True
+        except (OSError, ValueError):
+            print('500 status code received.')
+            return False
 
-        # Connect 
-        if len(parts) == 3 and parts[0] == "connect":
+    def await_response(self, timeout=10):
+        with self.response_condition:
+            if not self.response_condition.wait_for(lambda: self.responses or not self.running,
+                                                    timeout=timeout):
+                return None
+            return self.responses.popleft() if self.responses else None
 
-            if control_socket is not None:
-                print("500 status code received.")
-                continue
+    def enqueue_response(self, message):
+        with self.response_condition:
+            self.responses.append(message)
+            self.response_condition.notify_all()
 
-            server_ip = parts[1]
+def receive_loop(self):
+        try:
+            while self.running:
+                payload = receive_encrypted(self.data, self.private_key)
+                print('Received encrypted message')
+                # File retrieval can contain arbitrary bytes, not UTF-8 text.
+                with self.pending_file_lock:
+                    expecting_file = self.pending_file is not None
+                if expecting_file and payload.startswith((b'200\n\n', b'500\n\n')):
+                    self.enqueue_response(payload)
+                    continue
+                try:
+                    message = payload.decode('utf-8')
+                except UnicodeDecodeError:
+                    # An unexpected binary message must not kill the receiver.
+                    self.enqueue_response(payload)
+                    continue
+                if message.startswith('200\n\nBroadcast\n'):
+                    parts = message.split('\n', 4)
+                    if len(parts) == 5:
+                        print('200 status code received.')
+                        print(f'Broadcast message from {parts[3]}: {parts[4]}')
+                elif message.startswith('200\n\nPrivate\n'):
+                    parts = message.split('\n', 4)
+                    if len(parts) == 5:
+                        print('200 status code received.')
+                        print(f'{parts[3]}: {parts[4]}')
+                elif message.startswith(('200\n\njoin\n', '200\n\nLogout\n')):
+                    # Asynchronous presence notifications are not command replies.
+                    pass
+                elif len(message) >= 3 and message[:3] in ('200', '500'):
+                    self.enqueue_response(payload)
+        except (ConnectionError, OSError, ValueError):
+            pass
+        finally:
+            self.running = False
+            with self.response_condition:
+                self.response_condition.notify_all()
 
+@staticmethod
+    def status(response):
+        if response is None:
+            return '500'
+        return response.split(b'\n', 1)[0].decode('ascii', errors='replace').strip()
+
+    def request(self, command):
+        if not self.send_command(command):
+            return None
+        return self.await_response()
+
+    def login(self, username):
+        if self.username is not None:
+            print('500 status code received.')
+            return
+        response = self.request('login\n\n' + username + '\n' + self.public_pem)
+        if self.status(response) == '200':
+            self.username = username
+            print('200 status code received. Login successful')
+        else:
+            print('500 status code received.')
+
+    def who(self):
+        response = self.request('who')
+        if self.status(response) == '200':
+            users = response.partition(b'\n\n')[2].decode('utf-8', errors='replace')
+            print('200 status code received. Users currently connected:', users)
+        else:
+            print('500 status code received.')
+
+    def broadcast(self, text):
+        # Existing team server sends the sender's broadcast back as its success display.
+        self.send_command('broadcast ' + text)
+
+    def private(self, username, text):
+        response = self.request('private ' + username + ' ' + text)
+        if self.status(response) == '200':
+            print('200 status code received. Message sent.')
+        else:
+            print('500 status code received.')
+def list_files(self):
+        response = self.request('list')
+        if self.status(response) == '200':
+            names = response.partition(b'\n\n')[2].decode('utf-8', errors='replace')
+            print('200 status code received. Files:', names)
+        else:
+            print('500 status code received.')
+
+    def store_file(self, filename):
+        try:
+            with open(filename, 'rb') as f:
+                contents = f.read()
+            if not contents:
+                # Existing server's file-receive helper accepts an empty framed payload.
+                encrypted_payload = struct.pack('!I', 0)
+            else:
+                encrypted = encrypt_bytes(contents, self.server_key)
+                if len(encrypted) > MAX_FRAME:
+                    raise ValueError('File too large')
+                encrypted_payload = struct.pack('!I', len(encrypted)) + encrypted
+            if not self.send_command('stor ' + filename):
+                return
+            # Data socket is full-duplex: receiver only reads; main thread writes.
+            with self.send_lock:
+                self.data.sendall(encrypted_payload)
+            response = self.await_response()
+            print('200 status code received. File Sent.' if self.status(response) == '200'
+                  else '500 status code received.')
+        except (OSError, ValueError, TypeError):
+            print('500 status code received.')
+
+ def retrieve_file(self, filename):
+        # Flag tells the receiver to preserve binary payload rather than decode it.
+        with self.pending_file_lock:
+            self.pending_file = filename
+        try:
+            response = self.request('retr ' + filename)
+            if self.status(response) != '200':
+                print('500 status code received.')
+                return
+            contents = response.partition(b'\n\n')[2]
+            with open(filename, 'wb') as f:
+                f.write(contents)
+            print('File retrieved.')
+        except OSError:
+            print('500 status code received.')
+        finally:
+            with self.pending_file_lock:
+                self.pending_file = None
+
+    def delete_file(self, filename):
+        response = self.request('dele ' + filename)
+        print('200 status code received. File deleted.' if self.status(response) == '200'
+              else '500 status code received.')
+
+    def quit(self):
+        if self.connected():
+            response = self.request('quit')
+            print('200 status code received.' if self.status(response) == '200'
+                  else '500 status code received.')
+        self.close()
+
+def main():
+    print('Starting client...')
+    client = ChatClient()
+    try:
+        while True:
             try:
-                control_port = int(parts[2])
-            except ValueError:
-                continue
-
-            control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-            try:
-                control_socket.connect((server_ip, control_port))
-                control_socket.sendall(command.encode())
-
-                
-                response = recv_connect_response(control_socket)
-                response_parts = response.split("\n\n", 1)
-
-                if get_status(response) == "200" and len(response_parts) > 1:
-
-                    data_lines = response_parts[1].strip().split("\n", 1)
-                    data_port = int(data_lines[0].strip())
-
-                    # save the servers public key for encrypting everything we send
-                    server_public_key = serialization.load_pem_public_key(
-                        data_lines[1].strip().encode()
-                    )
-
-                    print(
-                        "200 status code received. "
-                        "Starting data connection on port",
-                        data_port
-                    )
-
-                    # create data socket and connect to the data port
-                    data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    data_socket.connect((server_ip, data_port))
-
-                    # start thread to listen for messages on the data socket
-                    receiver_thread = threading.Thread(
-                        target=receive_messages,
-                        args=(data_socket,),
-                        daemon=True
-                    )
-                    receiver_thread.start()
-                else:
-                    print("500 status code received.")
-                    control_socket.close()
-                    control_socket = None
-
-
-            except (ConnectionError, OSError, ValueError, IndexError):
-                print("500 status code received.")
-
-                if control_socket is not None:
-                    control_socket.close()
-
-                control_socket = None
-                data_socket = None
-
-        # Login - username + public key, encrypted with the server's key
-        elif len(parts) == 2 and parts[0] == "login":
-            if control_socket is None or data_socket is None:
-                continue
-
-            response_event.clear()
-
-            pending_login = parts[1]
-
-            
-            send_encrypted(
-                control_socket,
-                "login\n\n" + parts[1] + "\n" + public_pem
-            )
-
-            response = wait_for_response()
-
-            if get_status(response) == "200":
-                print("200 status code received. Login successful")
-            else:
-                print("500 status code received.")
-
-
-
-        elif command == "who":
-            if control_socket is None or data_socket is None:
-                continue
-
-            response_event.clear()
-            send_encrypted(control_socket, command)
-
-            response = wait_for_response()
-
-            response_parts = response.split("\n\n", 1)
-
-            if get_status(response) == "200":
-                users = ""
-
-                if len(response_parts) > 1:
-                    users = response_parts[1].strip()
-
-                print(
-                    "200 status code received. "
-                    "Users currently connected:",
-                    users
-                )
-            else:
-                print("500 status code received.")
-
-        # Broadcast
-        elif len(parts) >= 2 and parts[0] == "broadcast":
-            if control_socket is None or data_socket is None:
-                continue
-
-            send_encrypted(control_socket, command)
-
-        # Private message
-        elif len(parts) >= 3 and parts[0] == "private":
-            if control_socket is None or data_socket is None:
-                continue
-
-            response_event.clear()
-            send_encrypted(control_socket, command)
-
-            response = wait_for_response()
-
-            if get_status(response) == "200":
-                print("200 status code received. Message sent.")
-            else:
-                print("500 status code received.")
-
-        # Quit
-        elif command == "quit":
-            if control_socket is None or data_socket is None:
+                command = input()
+            except EOFError:
                 break
+            parts = command.strip().split(maxsplit=2)
+            if not parts:
+                continue
+            action = parts[0]
+            if action == 'connect' and len(parts) == 3:
+                client.connect(parts[1], parts[2])
+            elif action == 'login' and len(parts) == 2:
+                client.login(parts[1])
+            elif action == 'who' and len(parts) == 1:
+                client.who()
+            elif action == 'broadcast' and len(parts) >= 2:
+                client.broadcast(command.strip().split(maxsplit=1)[1])
+            elif action == 'private' and len(parts) == 3:
+                client.private(parts[1], parts[2])
+            elif action == 'list' and len(parts) == 1:
+                client.list_files()
+            elif action == 'stor' and len(parts) == 2:
+                client.store_file(parts[1])
+            elif action == 'retr' and len(parts) == 2:
+                client.retrieve_file(parts[1])
+            elif action == 'dele' and len(parts) == 2:
+                client.delete_file(parts[1])
+            elif action == 'quit' and len(parts) == 1:
+                client.quit()
+                return
+            else:
+                print('500 status code received.')
+    finally:
+        client.close()
 
-            response_event.clear()
 
-            try:
-                send_encrypted(control_socket, command)
-
-                response = wait_for_response()
-
-                if get_status(response) == "200":
-                    print("200 status code received.")
-                else:
-                    print("500 status code received.")
-
-            except (ConnectionError, OSError):
-                pass
-
-            control_socket.close()
-            data_socket.close()
-
-            break
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
+

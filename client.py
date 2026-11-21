@@ -13,9 +13,10 @@ from cryptography.hazmat.primitives.asymmetric import rsa, padding
 # ------------------------------------------------------------
 
 KEY_SIZE = 2048
-BLOCK_SIZE = KEY_SIZE // 8  
-
-SEND_HASH = hashes.SHA256  
+BLOCK_SIZE = KEY_SIZE // 8
+OAEP = padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+CHUNK_SIZE = BLOCK_SIZE - 2 * hashes.SHA256().digest_size - 2
+MAX_FRAME = 8 * 1024 * 1024  
 
 
 def make_oaep(hash_type):

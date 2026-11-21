@@ -199,6 +199,11 @@ def handle_client(control_connection, data_connection, private_key):
             if not command:
                 break
 
+            # Return the SHA-256 digest of each decrypted command, encrypted
+            # with the individual client's RSA public key on the data socket.
+            if username is not None:
+                send_message_hash(data_connection, command, client_public_key)
+
             # divide command into command name and optional argument
             parts = command.split(maxsplit=1)
 
@@ -281,6 +286,8 @@ def handle_client(control_connection, data_connection, private_key):
                         client_public_key
                     )
 
+                    send_message_hash(data_connection, command, client_public_key)
+
                     join_message = (
                         "200\n\n"
                         "join\n"
@@ -358,6 +365,10 @@ def handle_client(control_connection, data_connection, private_key):
                     break
 
                 filename = parts[1]
+                if (not filename or os.path.basename(filename) != filename
+                        or filename in ('.', '..', 'server.py', 'client.py')):
+                    send_encrypted(data_connection, "500\n\n", client_public_key)
+                    continue
 
                 print(
                     f"Stor {filename} requested by {username}"
@@ -404,6 +415,10 @@ def handle_client(control_connection, data_connection, private_key):
                     break
 
                 filename = parts[1]
+                if (not filename or os.path.basename(filename) != filename
+                        or filename in ('.', '..', 'server.py', 'client.py')):
+                    send_encrypted(data_connection, "500\n\n", client_public_key)
+                    continue
 
                 print(
                     f"Retr requested by {username}. "
@@ -461,6 +476,10 @@ def handle_client(control_connection, data_connection, private_key):
                     break
 
                 filename = parts[1]
+                if (not filename or os.path.basename(filename) != filename
+                        or filename in ('.', '..', 'server.py', 'client.py')):
+                    send_encrypted(data_connection, "500\n\n", client_public_key)
+                    continue
 
                 print(
                     f"Dele requested by {username}. "

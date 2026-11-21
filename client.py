@@ -170,10 +170,15 @@ class ChatClient:
             while self.running:
                 payload = receive_encrypted(self.data, self.private_key)
                 print('Received encrypted message')
+                if len(payload) == hashes.SHA256().digest_size:
+                    # Encrypted SHA-256 command receipt (32 raw digest bytes).
+                    continue
                 # File retrieval can contain arbitrary bytes, not UTF-8 text.
                 with self.pending_file_lock:
                     expecting_file = self.pending_file is not None
-                if expecting_file and payload.startswith((b'200\n\n', b'500\n\n')):
+                if (expecting_file and payload.startswith((b'200\n\n', b'500\n\n'))
+                        and not payload.startswith((b'200\n\nBroadcast\n', b'200\n\nPrivate\n',
+                                                    b'200\n\njoin\n', b'200\n\nLogout\n'))):
                     self.enqueue_response(payload)
                     continue
                 try:

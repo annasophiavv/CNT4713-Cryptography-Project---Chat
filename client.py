@@ -1,8 +1,10 @@
 # CNT4713 Cryptography Project - Chat
 # Client implementation
+import os
 import socket
 import struct
 import threading
+from collections import deque
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding

@@ -106,7 +106,7 @@ class ChatClient:
         with self.response_condition:
             self.response_condition.notify_all()
 
-def connect(self, host, port):
+    def connect(self, host, port):
         if self.connected() or self.control is not None:
             print('500 status code received.')
             return
@@ -141,7 +141,7 @@ def connect(self, host, port):
                 data.close()
             self.control = self.data = None
 
-def send_command(self, text):
+    def send_command(self, text):
         if not self.connected():
             print('500 status code received.')
             return False
@@ -165,7 +165,7 @@ def send_command(self, text):
             self.responses.append(message)
             self.response_condition.notify_all()
 
-def receive_loop(self):
+    def receive_loop(self):
         try:
             while self.running:
                 payload = receive_encrypted(self.data, self.private_key)
@@ -204,7 +204,7 @@ def receive_loop(self):
             with self.response_condition:
                 self.response_condition.notify_all()
 
-@staticmethod
+    @staticmethod
     def status(response):
         if response is None:
             return '500'
@@ -244,7 +244,7 @@ def receive_loop(self):
             print('200 status code received. Message sent.')
         else:
             print('500 status code received.')
-def list_files(self):
+    def list_files(self):
         response = self.request('list')
         if self.status(response) == '200':
             names = response.partition(b'\n\n')[2].decode('utf-8', errors='replace')
@@ -275,7 +275,7 @@ def list_files(self):
         except (OSError, ValueError, TypeError):
             print('500 status code received.')
 
- def retrieve_file(self, filename):
+    def retrieve_file(self, filename):
         # Flag tells the receiver to preserve binary payload rather than decode it.
         with self.pending_file_lock:
             self.pending_file = filename
